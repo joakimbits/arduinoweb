@@ -1,38 +1,31 @@
-/* Gas monitoring using the Arduino sensor platform.
+/* Gas monitoring using the Arduino sensor platform in an arduously efficient manner.
 12345678901234567890123456789012345678901234567890123456789012345678901234567890
 http://www.instructables.com/id/Arduino-Timer-Interrupts/step2/Structuring-Timer-Interrupts/
 
 SENSORS
 MQ-7 CO sensor
 - Heater 0V, 1.4V and 5V supplied from three PWM pins.
-- Bias oo, 36k, 18k, 12k and 9k ohm supplied from internal pull-up resistances.
+- Bias oo, 36k, 18k, 12k and 9k ohm from 5V supplied from internal pull-up resistances.
 - Bias voltage drop measured by substracting pull-up voltage from 5V.
 - Sensor voltage drop measured differentially in a 4-point measurement.
+- timeH, timeL and value for ref, n, p, bias, nnx1 and pnx1 channels sent at 76800 baud.
 
 RESOURCES
-Arduino Mega ADK http://arduino.cc/en/Hacking/PinMapping2560
-- DIGITAL GND      0V >200mA sink     MQ-7 heater and sensor bias voltage
-- DIGITAL 42-49    0-5V >200mA source MQ-7 heater and sensor bias voltage
-- ANALOG IN 14-15  Differential input MQ-7 sensor voltage
-- PWM 13           LED source         Activity indicator
-- USB              5V, COM            Power supply and host control
-- ADC              0-5V input         Measure analog sensors
-- TIMER2           256 bits 16MHz     Controller timing
-- STATIC RAM       >2 kB              1 kB cyclic buffers
-
-SERVICES
-Controller
-- Reads bias voltage values and wait intervals from 256-cyclic buffers 
-'bias[tick]' and 'wait[tick]' respectively, until wait[tick]=0. 
-- Stores adc values measured immediately before each change into 'values[tick]'.
-Server
-- Transfers interleaved bias voltages and wait intervals from serial port to 
-controller.
-- Transfers adc values from controller to serial port.
+- DIGITAL GND      0V >200mA sink       MQ-7 heater reference.
+- DIGITAL 44-46    0-5V >200mA source   MQ-7 heater voltage.
+- ANALOG IN 12-15  36kOhm pullups to 5V MQ-7 bias voltage.
+- ANALOG IN 11     ADC11                MQ-7 sensor voltage, bias side.
+- ANALOG IN 10     ADC10                MQ-7 sensor voltage, reference side.
+- ANALOG IN 8-9    0V >100mA sink       MQ-7 sensor reference.
+- PWM 13           LED source           MQ-7 activity indicator (not yet used).
+- ADC              0-5V input           MQ-7 bias and sensor voltage measurements.
+- TIMER4           250kHz timer			MQ-7 scheduler.
+- TIMER5           16MHz timer			MQ-7 heater PWM.
+- RAM              <1kB                 MQ-7 static variables.
+- USB              5V, COM              Power supply and host control.
 */
 
-// General settings
-#define Clockrate             16000000                /* CPU rate=16 MHz. */
+// Power control
 #define power_setup() 		  { 					  /* Configure power savings. */\
     DIDR0 = DIDR2 = 0xFF; /* Power off ADC digital input buffers. */\
 	PRR0 = B10101101; /* Power off TWI Timer0:1 SPI ADC. */\
@@ -42,60 +35,22 @@ controller.
 	sleep_bod_disable(); /* Disable VCC level detection. */\
 }
 
+// UART control
+#define uart_baudrate        76800 /* Highest good baudrate on Arduino is 76800. */
+#define _uart_ubrr           12 /* F_CPU/16/uart_baudrate - 1 */
+#define _uart_baudrate       F_CPU/16/(_uart_ubrr + 1) /* 76923.08 */
+#define uart_convert_us      130 /* 10000000/_uart_baudrate */ 
+#define uart_setup()         Serial.begin(uart_baudrate)
+#define uart_set(c)          UDR = c /* Transmit character. */
+#define uart_get()           UDR /* Get received character. */
+
 // ADC control
-/* http://www.atmel.com/Images/doc2549.pdf
-ADMUX can be safely updated in the following ways:
-1. When ADATE or ADEN is cleared.
-2. During conversion, minimum one ADC clock cycle after the trigger event.
-3. After a conversion, before the interrupt flag is cleared.
-When updating ADMUX in one of these conditions, the new settings will affect the
-next ADC conversion. Special care should be taken when changing differential 
-channels. Once a differential channel has been selected, the stage may take as 
-much as 125μs to stabilize to the new value. Thus conversions should not be 
-started within the first 125μs after selecting a new differential channel.
-
-The stage has a built-in offset cancellation circuitry that nulls the offset of 
-differential measurements as much as possible. The remaining offset in the analog 
-path can be measured directly by selecting the same channel for both differential 
-inputs. This offset residue can be then subtracted in software from the 
-measurement results. Using this kind of software based offset correction, offset 
-on any channel can be reduced below one LSB.
-
-The ADC features a noise canceler that enables conversion during sleep mode to 
-reduce noise induced from the CPU core and other I/O peripherals. The noise 
-canceler can be used with ADC Noise Reduction and Idle mode. To make use of this 
-feature, the following procedure should be used:
-1. Make sure that the ADC is enabled and is not busy converting. Single Conversion
-mode must be selected and the ADC conversion complete interrupt must be enabled.
-2. Enter ADC Noise Reduction mode (or Idle mode). The ADC will start a conversion
-once the CPU has been halted.
-3. If no other interrupts occur before the ADC conversion completes, the ADC 
-interrupt will wake up the CPU and execute the ADC Conversion Complete interrupt 
-routine. If another interrupt wakes up the CPU before the ADC conversion is 
-complete, that interrupt will be executed, and an ADC Conversion Complete 
-interrupt request will be generated when the ADC conversion completes. The CPU 
-will remain in active mode until a new sleep command is executed.
-
-A normal conversion takes 13 ADC clock cycles. The first conversion after the 
-ADC is switched on (ADEN in ADCSRA is set) takes 25 ADC clock cycles in order to 
-initialize the analog circuitry.  The actual sample-and-hold takes place 1.5 ADC 
-clock cycles after the start of a normal conversion and 13.5 ADC clock cycles 
-after the start of an first conversion. When a conversion is complete, the result 
-is written to the ADC Data Registers, and ADIF is set. In Single Conversion mode, 
-ADSC is cleared simultaneously. The software may then set ADSC again, and a new
-conversion will be initiated on the first rising ADC clock edge.
-Table 26-1. ADC Conversion Time
-Condition                        Sample & Hold cycles   Conversion Cycles
-First conversion                 13.5                   25
-Normal conversions, single ended  1.5                   13
-Auto Triggered conversions        2                     13.5
-Normal conversions, differential  1.5/2.5               13/14
-*/
-
-#define adc_clockrate         Clockrate/128			  /* ADC clockrate 125kHz. */
+#define adc_clockrate         F_CPU/128			  /* ADC clock = 125kHz. */
 #define adc_diff_settle_us    125       /* <125μs to stabilize differential net. */
-#define adc_sample_us         adc_clockrate*27/2000000 /* 1.7 us first sampling time. */
-#define adc_convert_us        adc_clockrate*25/1000000 /* 3.125 us first conversion time. */
+#define adc_first_sample_us   adc_clockrate*27/2000000 /* 1.7 us first sampling time. */
+#define adc_first_convert_us  adc_clockrate*25/1000000 /* 3.125 us first conversion time. */
+#define adc_sample_us         adc_clockrate*3/2000000  /* 0.1875 us normal sampling time. */
+#define adc_convert_us        adc_clockrate*13/1000000 /* 1.625 us normal conversion time. */
 #define adc_on()              ADCSRA = B10000111      /* Power on ADC. */
 #define adc_start()           ADCSRA = B11001111      /* Start ADC. */
 #define adc_start_sleep()     sleep_cpu()             /* Start ADC with CPU off. */
@@ -110,26 +65,7 @@ Normal conversions, differential  1.5/2.5               13/14
 #define adc_get_channel()     (						  /* Get ADC channel. */\
 	ADMUX & B1111 | (ADCSRB & B1000) << 2)
 
-
-// Sensor wiring.
-/* Pin mapping table
-Name Functions     Arduino pin          Wiring
-PK0  ADC8/PCINT16  Analog input pin 8   sensor_ref
-PK1  ADC9/PCINT17  Analog input pin 9   sensor_ref
-PK2  ADC10/PCINT18 Analog input pin 10  sensor_n
-PK3  ADC11/PCINT19 Analog input pin 11  sensor_p
-PK4  ADC12/PCINT20 Analog input pin 12  sensor_bias
-PK5  ADC13/PCINT21 Analog input pin 13  sensor_bias
-PK6  ADC14/PCINT22 Analog input pin 14  sensor_bias
-PK7  ADC15/PCINT23 Analog input pin 15  sensor_bias
-PL3  OC5A          Digital pin 46       sensor_heater
-PL4  OC5B          Digital pin 45       sensor_heater
-PL5  OC5C          Digital pin 44       sensor_heater
-Internal pull-up resistance: 36 kOhm
-The sum of all IOH for ports C0-C7, G0-G1, D0-D7, L0-L7 should not exceed 200mA.
-*/
-
-// Sensor bias control.
+// Sensor bias control
 #define sensor_setup     PORTK /* Sensor measurement pins. */
 #define sensor_output    DDRK /* Sensor measurement pin directions. */
 #define sensor_status    PINK /* Sensor measurement pin values. */ 
@@ -151,7 +87,7 @@ The sum of all IOH for ports C0-C7, G0-G1, D0-D7, L0-L7 should not exceed 200mA.
   /* Connect selected number of 36kOhm bias resistors to 5V. */\ 
 }
 
-// Sensor measurement channels.
+// Sensor measurement channels
 #define sensor_refCh     B100001 /* ADC9 */
 #define sensor_nCh       B100010 /* ADC10 */
 #define sensor_pCh       B100011 /* ADC11 */
@@ -163,7 +99,7 @@ The sum of all IOH for ports C0-C7, G0-G1, D0-D7, L0-L7 should not exceed 200mA.
 #define sensor_0x10Ch    B101100 /* ADC10-ADC10 10× */
 #define sensor_0x200Ch   B101110 /* ADC10-ADC10 200× */
 
-// Sensor heater control.
+// Sensor heater control
 #define heater_range       ICR5     /* DAC range for digital pins 44-46. */
 #define heater_value       OCR5A=OCR5B=OCR5C /* DAC value for -"-. */
 #define heater_trace_vect  TIMER5_COMPA_vect /* Heater on/off event. */
@@ -181,110 +117,132 @@ The sum of all IOH for ports C0-C7, G0-G1, D0-D7, L0-L7 should not exceed 200mA.
   heater_on();\
 }
 
-// Schedule control.
+// Schedule control
 #define schedule_setup() {                           /* Configure timer. */\
   TCCR4A = B11000000; /* Set OC4A on compare match. */\
   TCCR4B = B00000011; /* Use 64/16MHz = 4us timing resolution. */\
 }
 #define schedule_start() TIMSK4 = B0000010       /* Enable alarm. */
 #define schedule_stop()  TIMSK4 = B0000000       /* Disable alarm. */
-#define schedule_alarm   OCR4A                   /* Alarm time. */
+#define schedule_set(t)  OCR4A = t               /* Set alarm time. */
 #define schedule_vect    TIMER4_COMPA_vect       /* Alarm event. */
-#define schedule_time    TCNT4                   /* Time/4us (word). */
+#define schedule_time()  TCNT4                   /* Time/4us (word). */
 #define schedule_ticks   65536                   /* Range 262ms/4us.*/
-#define schedule_Hz      Clockrate/64            /* 1s=250000 ticks.*/ 
+#define schedule_Hz      F_CPU/64                /* 1s=250000 ticks.*/ 
 #define schedule_kHz     schedule_Hz/1000        /* 1ms=250 ticks.*/ 
 #define schedule_MHz     schedule_kHz/1000       /* 1us=1/4 ticks.*/ 
 
-// Sensor schedule.
+// Sensor schedule
 #define normChannels     4 /* Normal ADC channels: ref, n, p, bias. */
 #define diffChannels     2 /* Differential ADC channels: pn, nn. */
-#define measure_ticks    schedule_MHz*( /* 64 measurement ticks. */\
-	diffChannels*adc_diff_settle_us + /* 2*125μs */\
-	(normChannels + diffChannels) * (adc_sample_us + adc_convert_us)) /* 6*5μs */
-#define heat_ticks       schedule_Hz /* 250000 ticks heat control interval.  */
-#define preheat_ticks    heat_ticks - measure_ticks /* 249936 ticks pre-heat. */
+#define channels         (normChannels + diffChannels)
+#define uart_ticks       33 /* uart_convert_us*schedule_MHz < 33 ticks */
+#define tx_ticks         channels * 3 * uart_ticks /* UART Tx time = 594 ticks (148.5μs). */
+#define first_ticks      (adc_first_sample_us + adc_first_convert_us)*schedule_MHz
+#define norm_ticks       (adc_sample_us + adc_convert_us)*schedule_MHz
+#define diff_ticks       (adc_diff_settle_us + adc_first_sample_us + adc_first_convert_us)*schedule_MHz
+#define measure_ticks    (first_ticks + (normChannels-1)*norm_ticks + diff_ticks)
+#define min_task_ticks   (tx_ticks + measure_ticks) /* Min task time = 662 ticks (165.5μs). */
 
-// Scheduler.
+// Scheduler
+volatile byte samples=0
+volatile int time[channels];
+volatile byte value[channels];
+ISR(ADC_vect) {
+	value[samples++] = ADCH;
+}
 ISR (schedule_vect) {
-	static byte skip=0; // Skip up to 255*262ms > 1 minute.
+	/*
+	Alternate through two heat settings: heat 1s*5V and 1s*1.4V. 
+	Send timeH, timeL and value of each ADC conversion to the uart at 76800 baud.
+	Alternate through five bias settings: oo, 36kOhm, 18kOhm, 12kOhm and 9kOhm.
+	Measure six channels: ref, n, p, bias, nnx1 and pnx1.
+	*/
+	static word skip=0; // Skip up to 0x1000*262ms > 4 hours.
 	if (skip)
 		skip--;
 	else {
-		static register byte event = 0; // Event counter.
-		switch (event++) {
+		static register char task = -1; // Task counter.
+		static register char event = -1; // Event counter.
+		static register char sample = -1; // Sample counter.
+		static register char bias = -1; // Bias counter.
+		static word alarm; // Alarm tick.
+		static word endtime; // End-of-task tick.
+		long ticks;
+		switch (++event) {
 			case 0: // Reset.
-				schedule_stop();
-				schedule_alarm = schedule_time;
-			case 1: // Pre-heat at 1.4V.
-				heater_set(7, 25); // = 5V * 7/25.
-				skip = preheat_ticks / schedule_ticks;
-				schedule_alarm += preheat_ticks;
-				schedule_start();
+				alarm = schedule_time();
+			case 1: // Alternate through heat using 5V and 1.4V.
+				switch(task = ++task % 2) {
+					case 0: // 1s * 5V
+						heater_set(25, 25);
+						ticks = schedule_Hz;
+						break;
+					case 1: // 1s * 1.4V
+						heater_set(7, 25);
+						ticks = schedule_Hz;
+						break;
+				}
+				endtime = alarm + ticks;
+				sample = 0;
+			case 2: // Send sampled timeH.
+				if (samples) {
+					uart_set(time[sample] >> 8);
+					schedule_set(alarm += uart_ticks);
+					break;
+				}
+			case 3: // Send sampled timeL.
+				if (samples) {
+					uart_set(time[sample]);
+					schedule_set(alarm += uart_ticks);
+					break;
+				}
+			case 4: // Send sampled value.
+				if (samples) {
+					uart_set(value[sample]);
+					schedule_set(alarm += uart_ticks);
+					samples--;
+					sample++;
+					ticks -= 3 * uart_ticks;
+					event = 1; // Next event = 2.
+					break;
+				}
+			case 5: // Wait for pre-heating to complete.
+				schedule_set(alarm += ticks);
+				skip = ticks / schedule_ticks;
 				break;
-			case 2: // Set bias. Measure ref, n, p, bias. Settle calibration. */
-				sensor_set_bias(4);
+			case 6: // Alternate through bias 0-4. Measure ref, n, p, bias. Settle calibration. */
+				sensor_set_bias(bias = ++bias % 5);
 				adc_on();
 				adc_set_channel(sensor_refCh);
+				time[0] = schedule_time() - endtime;
 				adc_start_sleep();
 				adc_set_channel(sensor_nCh);
+				time[1] = schedule_time() - endtime;
 				adc_start_sleep();
 				adc_set_channel(sensor_pCh);
+				time[2] = schedule_time() - endtime;
 				adc_start_sleep();
 				adc_set_channel(sensor_biasCh);
+				time[3] = schedule_time() - endtime;
 				adc_start_sleep();
 				adc_off();
 				adc_set_channel(sensor_0x1Ch);
-				schedule_alarm += (4*(adc_sample_us + adc_convert_us) + 
-				                   adc_diff_settle_us)*schedule_MHz;
-				break;
-			case 3: // Convert calibration. Settle sensor signal. */
-				adc_on();
-				adc_start_sleep();
-				adc_off();
-				adc_set_channel(sensor_x1Ch);
-				schedule_alarm += (adc_sample_us + adc_convert_us + 
-				                   adc_diff_settle_us)*schedule_MHz;
-				break;
-			case 4: // Convert sensor signal. Finish heat control . */
-				schedule_alarm += (adc_sample_us + adc_convert_us)*schedule_MHz;
-				adc_on();
-				adc_start_sleep();
-				adc_off();
-				break;
-			case 5: // Pre-heat at 5V.
-				heater_set(25, 25); // = 5V * 25/25.
-				skip = preheat_ticks / schedule_ticks;
-				schedule_alarm += preheat_ticks;
-				break;
-			case 6: // Set bias. Measure ref, n, p, bias. Settle calibration. */
-				sensor_set_bias(4);
-				adc_on();
-				adc_set_channel(sensor_refCh);
-				adc_start_sleep();
-				adc_set_channel(sensor_nCh);
-				adc_start_sleep();
-				adc_set_channel(sensor_pCh);
-				adc_start_sleep();
-				adc_set_channel(sensor_biasCh);
-				adc_start_sleep();
-				adc_off();
-				adc_set_channel(sensor_0x1Ch);
-				schedule_alarm += (4*(adc_sample_us + adc_convert_us) + 
-				                   adc_diff_settle_us)*schedule_MHz;
+				schedule_set(alarm = endtime - 2 * diff_ticks);
 				break;
 			case 7: // Convert calibration. Settle sensor signal. */
 				adc_on();
+				time[4] = schedule_time() - endtime;
 				adc_start_sleep();
 				adc_off();
 				adc_set_channel(sensor_x1Ch);
-				schedule_alarm += (adc_sample_us + adc_convert_us + 
-				                   adc_diff_settle_us)*schedule_MHz;
+				schedule_set(alarm += endtime - diff_ticks);
 				break;
-			case 8: // Convert sensor signal. Finish 5V heat control. */
-				schedule_alarm += (adc_sample_us + adc_convert_us)*schedule_MHz;
-				event = 1;
+			case 8: // Convert sensor signal. Finish heat control . */
+				schedule_set(alarm = endtime);
+				event = 0; // Next event = 1.
 				adc_on();
+				time[5] = schedule_time() - endtime;
 				adc_start_sleep();
 				adc_off();
 				break;
@@ -292,31 +250,15 @@ ISR (schedule_vect) {
 	}
 }
 
-// ADC handler.
-volatile byte sample=255, value[256];
-ISR(ADC_vect) {
-	value[++sample] = ADCH;
-}
-
 void setup() {
   noInterrupts();
   power_setup();
+  uart_setup();
   sensor_setup();
   heater_setup(();
   schedule_setup(();
   interrupts();
 }
 
-/* PROTOCOL */
-
-/* APPLICATION */
-
-#define SampleInterval 10000 /*ms*/
-
 void loop() {
-  static unsigned long t0 = millis();
-  if( millis() - t0 > SampleInterval ) {
-    OS_2_1_THpacket( 2, edge, magnitudes[edge] );
-    t0 += SampleInterval;
-  }
 }
